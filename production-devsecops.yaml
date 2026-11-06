@@ -1,0 +1,198 @@
+name: Production DevSecOps
+run-name: ${{ github.actor }} is running DevSecOps 🔐
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ["production"]
+    types: [opened, reopened, synchronize, ready_for_review]
+
+jobs:
+
+  #  -----------------
+  # |🔑 SECRET SCAN   |
+  #  -----------------
+  secret-scan:
+    if: github.actor != 'dependabot[bot]'
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install Gitleaks
+        run: |
+          GITLEAKS_VERSION=$(curl -s https://api.github.com/repos/gitleaks/gitleaks/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | sed 's/v//')
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz -C /usr/local/bin gitleaks
+      - name: Run Gitleaks
+        run: gitleaks detect --source . --verbose --config rules/.gitleaks.toml
+
+  #  -------
+  # |🔍 SAST|
+  #  -------
+  sast:
+    if: github.actor != 'dependabot[bot]'
+    name: SAST - Semgrep
+    needs: secret-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run Semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >
+            p/csharp
+            p/owasp-top-ten
+
+  #  -------------------
+  # |🐳 DOCKERFILE LINT  |
+  #  -------------------
+  dockerfile-lint:
+    if: github.actor != 'dependabot[bot]'
+    name: Dockerfile Lint - Hadolint
+    needs: sast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: src/CollateralManagementSystemWLO/Dockerfile
+          failure-threshold: error
+
+  #  ---------
+  # |✅ CHECKOV|
+  #  ---------
+  checkov:
+    if: github.actor != 'dependabot[bot]'
+    name: IaC Scan - Checkov
+    needs: dockerfile-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Checkov
+        run: pip install checkov --break-system-packages
+      - name: Run Checkov on Dockerfile
+        run: checkov -f src/CollateralManagementSystemWLO/Dockerfile --framework dockerfile --quiet
+      - name: Run Checkov on Docker Compose
+        run: checkov -f docker-compose.yml --framework yaml --quiet
+
+  #  ---------------------------
+  # |📦 SCA - DEPENDENCY AUDIT  |
+  #  ---------------------------
+  sca:
+    if: github.actor != 'dependabot[bot]'
+    name: SCA - Dependency Vulnerability Audit
+    needs: checkov
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget
+
+      - name: Add DevExpress Package source
+        run: |
+          dotnet nuget add source https://nuget.devexpress.com/${{ secrets.DEV_EXPRESS_KEY }}/api -n "DevExpress"
+
+      - name: Add DAD.CoreService Package source
+        run: |
+          dotnet nuget add source https://nuget.pkg.github.com/${{ secrets.NUGET_JTRB_SOURCE }}/index.json \
+            --name "DAD.CoreService" \
+            --username ${{ secrets.NUGET_JTRB_USERNAME }} \
+            --password ${{ secrets.NUGET_JTRB_TOKEN }} \
+            --store-password-in-clear-text
+
+      - name: Restore dependencies
+        run: dotnet restore src/CollateralManagementSystemWLO/CollateralManagementSystemWLO.csproj
+
+      - name: OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'CollateralManagementSystemWLO'
+          path: '.'
+          format: 'HTML'
+          args: >
+            --failOnCVSS 9
+            --enableRetired
+            --suppression rules/odc-suppressions.xml
+        env:
+          JAVA_HOME: /opt/jdk
+
+      - name: Upload vulnerability report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: dependency-check-report
+          path: reports/
+
+  #  ----------------------
+  # |📜 LICENSE COMPLIANCE  |
+  #  ----------------------
+  license-check:
+    if: github.actor != 'dependabot[bot]'
+    name: License Compliance Check
+    needs: sca
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget
+
+      - name: Add DevExpress Package source
+        run: |
+          dotnet nuget add source https://nuget.devexpress.com/${{ secrets.DEV_EXPRESS_KEY }}/api -n "DevExpress"
+
+      - name: Add DAD.CoreService Package source
+        run: |
+          dotnet nuget add source https://nuget.pkg.github.com/${{ secrets.NUGET_JTRB_SOURCE }}/index.json \
+            --name "DAD.CoreService" \
+            --username ${{ secrets.NUGET_JTRB_USERNAME }} \
+            --password ${{ secrets.NUGET_JTRB_TOKEN }} \
+            --store-password-in-clear-text
+
+      - name: Restore dependencies
+        run: dotnet restore src/CollateralManagementSystemWLO/CollateralManagementSystemWLO.csproj
+
+      - name: Install dotnet-project-licenses
+        run: dotnet tool install --global dotnet-project-licenses
+
+      - name: Run license check
+        env:
+          DOTNET_ROLL_FORWARD: Major
+        run: |
+          mkdir -p licenses/
+          dotnet-project-licenses \
+            -i src/CollateralManagementSystemWLO \
+            -t \
+            --use-project-assets-json \
+            -j \
+            -f licenses/
+
+      - name: Upload license report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: license-check-report
+          path: licenses/
